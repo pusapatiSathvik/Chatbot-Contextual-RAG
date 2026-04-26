@@ -3,7 +3,7 @@ from chromadb import PersistentClient
 from chromadb.utils import embedding_functions
 from langchain_ollama import OllamaLLM
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 from tqdm import tqdm
 
 
@@ -20,8 +20,29 @@ class ContextualVectorDB:
             name=self.name,
             embedding_function=self.embedding_fn,
         )
-        # Use langchain_ollama (same package as inference_by_Ollama.py)
         self.llm = OllamaLLM(model="llama3.1")
+
+    # ------------------------------------------------------------------
+    # Duplicate detection
+    # ------------------------------------------------------------------
+
+    def get_known_hashes(self) -> Set[str]:
+        """
+        Return the set of original_uuid (SHA-256 hashes) already stored.
+        Used by upload_create_chunks() to reject duplicate documents.
+        """
+        if not self.metadata or "metadatas" not in self.metadata:
+            return set()
+        seen: Set[str] = set()
+        for meta in self.metadata.get("metadatas", []):
+            h = meta.get("original_uuid", "")
+            if h:
+                seen.add(h)
+        return seen
+
+    # ------------------------------------------------------------------
+    # Context generation
+    # ------------------------------------------------------------------
 
     def situate_context(self, doc: str, chunk: str) -> str:
         """Ask the LLM to produce a short context sentence for a chunk."""
@@ -40,7 +61,7 @@ class ContextualVectorDB:
     # ------------------------------------------------------------------
 
     def load_data(self, dataset: List[Dict[str, Any]], parallel_threads: int = 4) -> None:
-        """Load a full dataset into ChromaDB.  Skips if DB already populated."""
+        """Load a full dataset into ChromaDB. Skips if DB already populated."""
         if self.collection.count() > 0:
             print("Vector database already populated — skipping data loading.")
             self.metadata = self.collection.get(include=["metadatas"])
@@ -60,6 +81,9 @@ class ContextualVectorDB:
                     "original_index": chunk["original_index"],
                     "original_content": chunk["content"],
                     "contextualized_content": contextualized_text,
+                    # Store for citations and duplicate detection
+                    "source_file": doc.get("source_file", doc["doc_id"]),
+                    "original_uuid": doc.get("original_uuid", ""),
                 },
             }
 
@@ -79,7 +103,6 @@ class ContextualVectorDB:
         print(f"Database loaded. Total chunks: {len(texts_to_embed)}")
 
     def _embed_and_store(self, texts: List[str], data: List[Dict[str, Any]]) -> None:
-        """Embed texts in batches and store in ChromaDB."""
         batch_size = 128
         with tqdm(total=len(texts), desc="Embedding & storing") as pbar:
             for i in range(0, len(texts), batch_size):
@@ -91,16 +114,14 @@ class ContextualVectorDB:
                     metadatas=batch_metadata,
                 )
                 pbar.update(len(batch_texts))
-
         self.metadata = self.collection.get(include=["metadatas"])
         print(f"Total documents in database: {self.collection.count()}")
 
     # ------------------------------------------------------------------
-    # Incremental data append (for new PDF uploads)
+    # Incremental append (for new PDF uploads)
     # ------------------------------------------------------------------
 
     def append_data(self, new_dataset: List[Dict[str, Any]], parallel_threads: int = 4) -> None:
-        """Add new documents to an existing ChromaDB collection."""
         if not new_dataset:
             print("No data to add.")
             return
@@ -119,6 +140,8 @@ class ContextualVectorDB:
                     "original_index": chunk["original_index"],
                     "original_content": chunk["content"],
                     "contextualized_content": contextualized_text,
+                    "source_file": doc.get("source_file", doc["doc_id"]),
+                    "original_uuid": doc.get("original_uuid", ""),
                 },
             }
 
@@ -158,7 +181,6 @@ class ContextualVectorDB:
                     metadatas=batch_metadata,
                 )
                 pbar.update(len(batch_texts))
-
         self.metadata = self.collection.get(include=["metadatas"])
         print(f"Total documents in database: {self.collection.count()}")
 
