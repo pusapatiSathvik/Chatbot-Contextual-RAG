@@ -34,6 +34,14 @@ def upload_create_chunks(
     text = upload_ocr(file, folder)
     original_uuid = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    # --- Duplicate detection ---
+    known_hashes = db.get_known_hashes()
+    if original_uuid in known_hashes:
+        raise ValueError(
+            f"'{file.filename}' is already in the database (duplicate content detected). "
+            "Skipping ingestion to avoid duplicate chunks."
+        )
+
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=overlap
     )
@@ -52,6 +60,7 @@ def upload_create_chunks(
     doc_data = {
         "doc_id": f"doc_{doc_id}",
         "original_uuid": original_uuid,
+        "source_file": file.filename,       # ← stored for citations
         "content": text,
         "chunks": chunks_data,
     }
