@@ -34,6 +34,7 @@ from ragas.metrics import faithfulness, answer_relevancy
 from ragas.metrics import context_precision, context_recall
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.run_config import RunConfig
 from datasets import Dataset
 
 # LangChain wrappers
@@ -285,11 +286,6 @@ def run_ragas_evaluation(
         metrics = [faithfulness, answer_relevancy]
         print("Mode: FAST — faithfulness + answer_relevancy (no ground truth needed)")
 
-    # Attach local models to each metric
-    for metric in metrics:
-        metric.llm = ragas_llm
-        if hasattr(metric, "embeddings"):
-            metric.embeddings = ragas_embeds
 
     print(f"\nLoading ChromaDB '{db_name}'…")
     metadatas = load_chunks_from_db(db_name)
@@ -298,13 +294,13 @@ def run_ragas_evaluation(
     dataset = build_ragas_dataset(metadatas, db_name, sample, full_metrics)
 
     print("\nRunning RAGAS evaluation…")
-    # is_async=False runs jobs sequentially — prevents TimeoutError on local Ollama
-    # raise_on_failure=False logs failures but still returns partial scores
     result = evaluate(
         dataset,
         metrics=metrics,
-        is_async=False,
-        raise_on_failure=False,
+        llm=ragas_llm,
+        embeddings=ragas_embeds,
+        raise_exceptions=False,
+        run_config=RunConfig(max_workers=1, timeout=600),
     )
 
     # Collect scores
