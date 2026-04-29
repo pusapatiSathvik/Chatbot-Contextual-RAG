@@ -4,16 +4,16 @@ evaluate_ragas.py
 Evaluates your RAG pipeline using the RAGAS framework with fully local models.
 
 Install first:
-    pip install ragas datasets
+    pip install ragas datasets langchain-ollama langchain-community
 
 Usage:
     # Quick test — 10 queries, no ground truth needed
     python evaluate_ragas.py --sample 10
 
-    # Full run with all 4 metrics (needs ground truth — LLM generates it)
+    # Full run with all 4 metrics (LLM generates reference answers)
     python evaluate_ragas.py --sample 20 --full
 
-    # Use a specific DB
+    # Custom DB name
     python evaluate_ragas.py --db_name my_contextual_db --sample 15
 """
 
@@ -26,7 +26,6 @@ warnings.filterwarnings("ignore")
 from pathlib import Path
 from typing import List, Dict, Any
 
-import requests
 from chromadb import PersistentClient
 
 # RAGAS imports
@@ -37,28 +36,40 @@ from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from datasets import Dataset
 
-# LangChain wrappers for local models
-from langchain_ollama import OllamaLLM
+# LangChain wrappers
+# ChatOllama is required for RAGAS — it uses chat-style prompt templates internally.
+# OllamaLLM (completion style) causes template errors inside RAGAS metrics.
+from langchain_ollama import ChatOllama, OllamaLLM
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 
 
-OLLAMA_URL  = "http://localhost:11434/api/generate"
 MODEL_ID    = "llama3.1"
 EMBED_MODEL = "all-mpnet-base-v2"   # same model your RAG already uses
+
+# Shared OllamaLLM instance — used for question/answer/reference generation.
+# Same pattern as inference_by_Ollama.py which is confirmed working.
+_ollama = OllamaLLM(model=MODEL_ID, temperature=0.0)
 
 
 # ---------------------------------------------------------------------------
 # Local model setup
 # ---------------------------------------------------------------------------
 
-def build_ragas_llm() -> LangchainLLMWrapper:
-    """Wrap Ollama llama3.1 so RAGAS can use it as a judge."""
-    llm = OllamaLLM(model=MODEL_ID, temperature=0.0)
-    return LangchainLLMWrapper(llm)
+def build_ragas_llm():
+    """
+    Wrap Ollama llama3.1 so RAGAS can use it as a judge.
+    Uses ChatOllama (not OllamaLLM) because RAGAS metrics use
+    chat-style message templates internally.
+    """
+    chat_model = ChatOllama(model=MODEL_ID, temperature=0.0)
+    return LangchainLLMWrapper(chat_model)
 
 
-def build_ragas_embeddings() -> LangchainEmbeddingsWrapper:
-    """Wrap the same SentenceTransformer your RAG uses — no extra model needed."""
+def build_ragas_embeddings():
+    """
+    Wrap the same SentenceTransformer your RAG already uses.
+    No extra model download needed.
+    """
     embeddings = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
     return LangchainEmbeddingsWrapper(embeddings)
 
@@ -85,7 +96,7 @@ def load_chunks_from_db(db_name: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Retrieve context for a query  (mirrors your actual retrieval pipeline)
+# Retrieve context  (uses your actual pipeline — not a mock)
 # ---------------------------------------------------------------------------
 
 def retrieve_context_for_query(
@@ -94,17 +105,17 @@ def retrieve_context_for_query(
     k: int = 5,
 ) -> List[str]:
     """
-    Run your actual retrieval pipeline and return the top-k chunk texts.
-    This means RAGAS evaluates the real system, not a mock.
+    Runs the real hybrid retrieval pipeline so RAGAS scores
+    reflect actual system performance.
+    Caches the DB + BM25 index after first call.
     """
     from contextual_vector_db import ContextualVectorDB
     from bm25 import create_bm25_index
     from retrieval import retrieve_advanced
 
-    # Lazy-load to avoid slow startup when not needed
     if not hasattr(retrieve_context_for_query, "_cache"):
         db = ContextualVectorDB(db_name)
-        db.load_data([])   # loads existing data from disk only
+        db.load_data([])   # loads existing data from disk, no re-embedding
         bm25 = create_bm25_index(db)
         retrieve_context_for_query._cache = (db, bm25)
 
@@ -118,7 +129,7 @@ def retrieve_context_for_query(
 
 
 # ---------------------------------------------------------------------------
-# Generate answer using Ollama  (mirrors your actual inference)
+# Answer generation  (mirrors your actual /chat endpoint)
 # ---------------------------------------------------------------------------
 
 def generate_answer(query: str, context_chunks: List[str]) -> str:
@@ -128,23 +139,19 @@ def generate_answer(query: str, context_chunks: List[str]) -> str:
         f"Context:\n{context}\n\n"
         f"Question: {query}\nAnswer:"
     )
-    resp = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL_ID, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
+    return _ollama.invoke(prompt).strip()
 
 
 # ---------------------------------------------------------------------------
-# Generate a reference answer  (needed for context_precision + context_recall)
+# Reference answer generation  (ground truth for full metrics)
 # ---------------------------------------------------------------------------
 
 def generate_reference_answer(query: str, golden_chunk: str) -> str:
     """
-    Ask the LLM to produce a reference answer from the golden chunk directly.
-    This becomes the 'ground truth' for context_precision and context_recall.
+    Generates a reference answer directly from the golden chunk.
+    Used as ground truth for context_precision and context_recall.
+    The LLM answers from the chunk itself — not from retrieved context —
+    so this is the most faithful possible answer for that question.
     """
     prompt = (
         "Read the following text and answer the question as accurately as possible "
@@ -153,17 +160,11 @@ def generate_reference_answer(query: str, golden_chunk: str) -> str:
         f"Question: {query}\n"
         "Answer concisely and factually:"
     )
-    resp = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL_ID, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
+    return _ollama.invoke(prompt).strip()
 
 
 # ---------------------------------------------------------------------------
-# Build RAGAS dataset
+# Build RAGAS-compatible dataset
 # ---------------------------------------------------------------------------
 
 def build_ragas_dataset(
@@ -174,14 +175,15 @@ def build_ragas_dataset(
 ) -> Dataset:
     """
     For each sampled chunk:
-      1. Generate a question from the chunk (LLM)
-      2. Retrieve context using the real pipeline
-      3. Generate an answer using the real pipeline
-      4. Optionally generate a reference answer for full metrics
+      1. LLM generates a question answerable from that chunk
+      2. Real retrieval pipeline fetches context
+      3. LLM generates an answer from retrieved context
+      4. (full mode only) LLM generates a reference answer from the chunk itself
 
-    Returns a HuggingFace Dataset ready for ragas.evaluate().
+    Returns a HuggingFace Dataset with columns:
+      question, answer, contexts, ground_truth
     """
-    # Filter out very short chunks
+    # Skip chunks that are too short to generate a meaningful question
     usable = [m for m in metadatas if len(m.get("original_content", "")) > 100]
     if not usable:
         raise ValueError("No usable chunks found (all too short).")
@@ -190,19 +192,20 @@ def build_ragas_dataset(
     sample_meta = random.sample(usable, min(sample, len(usable)))
     print(f"Building evaluation dataset from {len(sample_meta)} chunks…")
 
-    rows = {
-        "question":        [],
-        "answer":          [],
-        "contexts":        [],
-        "ground_truth":    [],  # required by RAGAS schema even if empty
+    rows: Dict[str, List] = {
+        "question":     [],
+        "answer":       [],
+        "contexts":     [],
+        "ground_truth": [],
     }
 
     for i, meta in enumerate(sample_meta):
         chunk_text  = meta.get("original_content", "").strip()
         source_file = meta.get("source_file", meta.get("doc_id", "unknown"))
-        print(f"  [{i+1}/{len(sample_meta)}] {source_file}  chunk {meta.get('original_index',0)}")
+        chunk_idx   = meta.get("original_index", 0)
+        print(f"  [{i+1}/{len(sample_meta)}] {source_file}  chunk {chunk_idx}")
 
-        # Step 1: Generate a question from this chunk
+        # Step 1: generate a question from this chunk
         q_prompt = (
             "Read the following text and generate ONE specific question "
             "that can be answered using ONLY this text. "
@@ -210,17 +213,12 @@ def build_ragas_dataset(
             f"Text:\n{chunk_text}"
         )
         try:
-            resp = requests.post(
-                OLLAMA_URL,
-                json={"model": MODEL_ID, "prompt": q_prompt, "stream": False},
-                timeout=120,
-            )
-            question = resp.json()["response"].strip().strip('"')
+            question = _ollama.invoke(q_prompt).strip().strip('"')
         except Exception as e:
             print(f"    WARN: question generation failed: {e}")
             continue
 
-        # Step 2: Retrieve context via your actual pipeline
+        # Step 2: retrieve context via the real pipeline
         try:
             context_chunks = retrieve_context_for_query(question, db_name, k=5)
         except Exception as e:
@@ -228,25 +226,26 @@ def build_ragas_dataset(
             continue
 
         if not context_chunks:
-            print(f"    WARN: no context retrieved, skipping.")
+            print(f"    WARN: no context retrieved — skipping.")
             continue
 
-        # Step 3: Generate answer via your actual pipeline
+        # Step 3: generate answer from retrieved context
         try:
             answer = generate_answer(question, context_chunks)
         except Exception as e:
             print(f"    WARN: answer generation failed: {e}")
             continue
 
-        # Step 4: Reference answer (only needed for full metrics)
+        # Step 4: reference answer (only for full metrics)
         if full_metrics:
             try:
                 reference = generate_reference_answer(question, chunk_text)
             except Exception as e:
-                print(f"    WARN: reference answer failed: {e}")
-                reference = chunk_text[:300]   # fall back to chunk text
+                print(f"    WARN: reference answer failed — using chunk text: {e}")
+                reference = chunk_text[:300]
         else:
-            reference = ""   # faithfulness + answer_relevancy don't need this
+            # faithfulness + answer_relevancy do not need ground_truth
+            reference = ""
 
         rows["question"].append(question)
         rows["answer"].append(answer)
@@ -254,14 +253,17 @@ def build_ragas_dataset(
         rows["ground_truth"].append(reference)
 
     if not rows["question"]:
-        raise ValueError("Failed to build any evaluation rows. Check Ollama is running.")
+        raise ValueError(
+            "No evaluation rows were built. "
+            "Check that Ollama is running and the DB has documents."
+        )
 
     print(f"\nBuilt {len(rows['question'])} evaluation samples.")
     return Dataset.from_dict(rows)
 
 
 # ---------------------------------------------------------------------------
-# Run RAGAS evaluation
+# Main evaluation runner
 # ---------------------------------------------------------------------------
 
 def run_ragas_evaluation(
@@ -275,14 +277,13 @@ def run_ragas_evaluation(
     ragas_llm    = build_ragas_llm()
     ragas_embeds = build_ragas_embeddings()
 
-    # Pick which metrics to run
     if full_metrics:
         metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
-        print("Running FULL evaluation: faithfulness + answer_relevancy + context_precision + context_recall")
-        print("NOTE: context_precision and context_recall use LLM-generated reference answers.")
+        print("Mode: FULL — faithfulness + answer_relevancy + context_precision + context_recall")
+        print("      context_precision and context_recall use LLM-generated reference answers.")
     else:
         metrics = [faithfulness, answer_relevancy]
-        print("Running FAST evaluation: faithfulness + answer_relevancy (no ground truth needed)")
+        print("Mode: FAST — faithfulness + answer_relevancy (no ground truth needed)")
 
     # Attach local models to each metric
     for metric in metrics:
@@ -290,67 +291,69 @@ def run_ragas_evaluation(
         if hasattr(metric, "embeddings"):
             metric.embeddings = ragas_embeds
 
-    # Load data and build dataset
     print(f"\nLoading ChromaDB '{db_name}'…")
     metadatas = load_chunks_from_db(db_name)
 
-    print(f"\nGenerating {sample} test cases (this calls Ollama for each chunk)…")
+    print(f"\nGenerating {sample} test cases…")
     dataset = build_ragas_dataset(metadatas, db_name, sample, full_metrics)
 
-    # Run RAGAS
     print("\nRunning RAGAS evaluation…")
-    result = evaluate(dataset, metrics=metrics)
+    # is_async=False runs jobs sequentially — prevents TimeoutError on local Ollama
+    # raise_on_failure=False logs failures but still returns partial scores
+    result = evaluate(
+        dataset,
+        metrics=metrics,
+        is_async=False,
+        raise_on_failure=False,
+    )
 
-    # Format output
-    scores = {}
+    # Collect scores
+    # EvaluationResult in newer RAGAS versions is accessed via index, not .get()
+    scores: Dict[str, float] = {}
     for metric in metrics:
-        key = metric.name
-        val = result.get(key)
-        if val is not None:
-            scores[key] = round(float(val), 4)
+        try:
+            val = result[metric.name]
+            if val is not None:
+                scores[metric.name] = round(float(val), 4)
+        except Exception:
+            print(f"  WARN: could not read score for {metric.name} — may have timed out.")
 
     output = {
-        "db_name":       db_name,
-        "samples":       len(dataset),
-        "metrics_used":  [m.name for m in metrics],
-        "scores":        scores,
+        "db_name":      db_name,
+        "samples":      len(dataset),
+        "metrics_used": [m.name for m in metrics],
+        "scores":       scores,
     }
 
-    # Pretty print
-    print(f"\n{'='*45}")
-    print(f"  RAGAS Evaluation Results")
-    print(f"{'='*45}")
-    print(f"  Samples evaluated : {len(dataset)}")
-    print(f"  Model used        : {MODEL_ID}")
-    print()
-
+    # Pretty print results
     score_labels = {
-        "faithfulness":     ("Faithfulness",      "Is the answer grounded in retrieved context?"),
-        "answer_relevancy": ("Answer Relevancy",   "Does the answer address the question?"),
-        "context_precision":("Context Precision",  "Are retrieved chunks actually useful?"),
-        "context_recall":   ("Context Recall",     "Did retrieval find all the needed info?"),
+        "faithfulness":      ("Faithfulness",       "Is the answer grounded in retrieved context?"),
+        "answer_relevancy":  ("Answer Relevancy",    "Does the answer address the question?"),
+        "context_precision": ("Context Precision",   "Are retrieved chunks actually useful?"),
+        "context_recall":    ("Context Recall",      "Did retrieval find all the needed info?"),
     }
 
+    print(f"\n{'='*48}")
+    print(f"  RAGAS Evaluation Results")
+    print(f"{'='*48}")
+    print(f"  Samples : {len(dataset)}   Model : {MODEL_ID}")
+    print()
     for key, val in scores.items():
         label, desc = score_labels.get(key, (key, ""))
-        bar_len = int(val * 20)
-        bar = "█" * bar_len + "░" * (20 - bar_len)
+        bar = "█" * int(val * 20) + "░" * (20 - int(val * 20))
         print(f"  {label:<22} {val:.4f}  [{bar}]")
         print(f"  {'':22} {desc}")
         print()
-
-    print(f"{'='*45}")
+    print(f"{'='*48}")
     print()
-
-    # Interpretation guide
-    print("  Score guide (all metrics are 0.0 → 1.0):")
+    print("  Score guide  (all metrics: 0.0 → 1.0)")
     print("  > 0.80  Excellent")
     print("  > 0.60  Good")
     print("  > 0.40  Needs improvement")
     print("  < 0.40  Something is broken")
     print()
 
-    # Save to file
+    # Save
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
@@ -367,15 +370,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Evaluate your RAG pipeline with RAGAS using fully local models."
     )
-    parser.add_argument("--db_name", default="my_contextual_db",
-                        help="ChromaDB collection name (default: my_contextual_db)")
-    parser.add_argument("--sample",  type=int, default=10,
-                        help="Number of chunks to sample for evaluation (default: 10)")
-    parser.add_argument("--full",    action="store_true",
-                        help="Run all 4 metrics including context_precision and context_recall "
-                             "(slower, uses LLM-generated reference answers)")
-    parser.add_argument("--output",  default="data/ragas_results.json",
-                        help="Where to save results JSON (default: data/ragas_results.json)")
+    parser.add_argument(
+        "--db_name", default="my_contextual_db",
+        help="ChromaDB collection name (default: my_contextual_db)"
+    )
+    parser.add_argument(
+        "--sample", type=int, default=10,
+        help="Number of chunks to sample (default: 10)"
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Run all 4 metrics — slower, uses LLM-generated reference answers"
+    )
+    parser.add_argument(
+        "--output", default="data/ragas_results.json",
+        help="Output path for results JSON (default: data/ragas_results.json)"
+    )
     args = parser.parse_args()
 
     run_ragas_evaluation(
