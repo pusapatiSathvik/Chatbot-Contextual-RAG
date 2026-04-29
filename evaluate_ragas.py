@@ -62,7 +62,9 @@ def build_ragas_llm():
     Uses ChatOllama (not OllamaLLM) because RAGAS metrics use
     chat-style message templates internally.
     """
-    chat_model = ChatOllama(model=MODEL_ID, temperature=0.0)
+    # format="json" forces llama3.1 to return strict JSON
+    # which is required for RAGAS prompt parsers to work correctly
+    chat_model = ChatOllama(model=MODEL_ID, temperature=0.0, format="json")
     return LangchainLLMWrapper(chat_model)
 
 
@@ -304,15 +306,23 @@ def run_ragas_evaluation(
     )
 
     # Collect scores
-    # EvaluationResult in newer RAGAS versions is accessed via index, not .get()
+    # EvaluationResult is accessed via index in newer RAGAS versions
+    # NaN means the LLM judge failed to parse — we detect and report it
+    import math
     scores: Dict[str, float] = {}
     for metric in metrics:
         try:
             val = result[metric.name]
-            if val is not None:
-                scores[metric.name] = round(float(val), 4)
-        except Exception:
-            print(f"  WARN: could not read score for {metric.name} — may have timed out.")
+            if val is None:
+                print(f"  WARN: {metric.name} returned None — skipping.")
+                continue
+            fval = float(val)
+            if math.isnan(fval):
+                print(f"  WARN: {metric.name} returned NaN — LLM failed to parse RAGAS output.")
+                continue
+            scores[metric.name] = round(fval, 4)
+        except Exception as e:
+            print(f"  WARN: could not read score for {metric.name}: {e}")
 
     output = {
         "db_name":      db_name,
