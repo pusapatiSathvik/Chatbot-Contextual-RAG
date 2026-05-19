@@ -2,3 +2,7 @@
 /Files_uploaded
 /.venv
 /SETUP_GUIDE.md
+.env
+__pycache__/
+*.pyc
+frontend/node_modules/
