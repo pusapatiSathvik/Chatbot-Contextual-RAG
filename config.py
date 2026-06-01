@@ -1,8 +1,8 @@
 """
-config.py
-=========
-Central configuration loader for the RAG chatbot.
-Phase 2 update: adds PDF extraction and semantic chunking settings.
+config.py — Central configuration loader.
+Phase 1: model backend + embedding.
+Phase 2: PDF extraction + chunking settings.
+Phase 3: single flag to enable all advanced retrieval strategies.
 """
 
 import os
@@ -38,15 +38,14 @@ BackendType = Literal["ollama", "openai", "anthropic", "gemini"]
 
 @dataclass
 class Settings:
-    # Core model
+
+    # ── Phase 1: Core model ─────────────────────────────────────────────────
     model_backend: BackendType = field(
         default_factory=lambda: os.environ.get("MODEL_BACKEND", "ollama").lower()
     )
     model_id: str = field(
         default_factory=lambda: os.environ.get("MODEL_ID", "llama3.1")
     )
-
-    # API keys
     openai_api_key: str = field(
         default_factory=lambda: os.environ.get("OPENAI_API_KEY", "")
     )
@@ -56,58 +55,64 @@ class Settings:
     google_api_key: str = field(
         default_factory=lambda: os.environ.get("GOOGLE_API_KEY", "")
     )
-
-    # Ollama
     ollama_base_url: str = field(
         default_factory=lambda: os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     )
-
-    # Embedding
     embedding_model: str = field(
         default_factory=lambda: os.environ.get("EMBEDDING_MODEL", "all-mpnet-base-v2")
     )
-
-    # Generation
     temperature: float = field(
         default_factory=lambda: float(os.environ.get("TEMPERATURE", "0.0"))
     )
     max_tokens: int = field(
         default_factory=lambda: int(os.environ.get("MAX_TOKENS", "1024"))
     )
-
-    # Features
     enable_contextual_enrichment: bool = field(
         default_factory=lambda: os.environ.get(
             "ENABLE_CONTEXTUAL_ENRICHMENT", "true"
         ).lower() == "true"
     )
 
-    # Phase 2 — Extraction
-    # "pymupdf" = native text (fast, accurate); "ocr" = always Tesseract
+    # ── Phase 2: PDF extraction ─────────────────────────────────────────────
     pdf_extractor: str = field(
         default_factory=lambda: os.environ.get("PDF_EXTRACTOR", "pymupdf")
     )
-    # Font-size ratio above median body text to be classified as a heading
-    heading_font_ratio: float = field(
-        default_factory=lambda: float(os.environ.get("HEADING_FONT_RATIO", "1.2"))
-    )
 
-    # Phase 2 — Semantic chunking
-    # Cosine-similarity drop below this threshold = topic boundary
-    semantic_split_threshold: float = field(
-        default_factory=lambda: float(os.environ.get("SEMANTIC_SPLIT_THRESHOLD", "0.3"))
-    )
+    # ── Phase 2: Semantic chunking ──────────────────────────────────────────
     min_chunk_chars: int = field(
         default_factory=lambda: int(os.environ.get("MIN_CHUNK_CHARS", "200"))
     )
     max_chunk_chars: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CHUNK_CHARS", "1500"))
     )
-    # Sentences of overlap between consecutive chunks for continuity
-    chunk_sentence_overlap: int = field(
-        default_factory=lambda: int(os.environ.get("CHUNK_SENTENCE_OVERLAP", "1"))
+
+    # ── Phase 3: Advanced retrieval ─────────────────────────────────────────
+    # Single flag — true enables ALL strategies at once:
+    #   query rewriting, multi-query, HyDE, MMR, adaptive-k
+    enable_advanced_retrieval: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_ADVANCED_RETRIEVAL", "false"
+        ).lower() == "true"
     )
 
+    # Tuning knobs (only matter when enable_advanced_retrieval=true)
+    # Number of query variations for multi-query
+    multi_query_count: int = field(
+        default_factory=lambda: int(os.environ.get("MULTI_QUERY_COUNT", "3"))
+    )
+    # MMR balance: 1.0 = pure relevance, 0.0 = pure diversity
+    mmr_lambda: float = field(
+        default_factory=lambda: float(os.environ.get("MMR_LAMBDA", "0.5"))
+    )
+    # Adaptive-k: if best reranker score < threshold, expand candidate pool
+    adaptive_k_threshold: float = field(
+        default_factory=lambda: float(os.environ.get("ADAPTIVE_K_THRESHOLD", "0.5"))
+    )
+    adaptive_k_max: int = field(
+        default_factory=lambda: int(os.environ.get("ADAPTIVE_K_MAX", "20"))
+    )
+
+    # ── Validation ──────────────────────────────────────────────────────────
     def __post_init__(self) -> None:
         valid = ("ollama", "openai", "anthropic", "gemini")
         if self.model_backend not in valid:
@@ -136,18 +141,18 @@ class Settings:
         key_hint = ""
         if not self.is_local:
             k = self.active_api_key
-            key_hint = f"  API key   : {'*'*8}{k[-4:] if len(k) > 4 else '(not set)'}\n"
+            key_hint = f"  API key      : {'*'*8}{k[-4:] if len(k) > 4 else '(not set)'}\n"
         return (
-            f"  Backend   : {self.model_backend}\n"
-            f"  Model     : {self.model_id}\n"
-            f"  Embed     : {self.embedding_model}\n"
-            f"  Temp      : {self.temperature}\n"
-            f"  MaxTok    : {self.max_tokens}\n"
+            f"  Backend      : {self.model_backend}\n"
+            f"  Model        : {self.model_id}\n"
+            f"  Embed        : {self.embedding_model}\n"
+            f"  Temp         : {self.temperature}\n"
+            f"  MaxTok       : {self.max_tokens}\n"
             f"{key_hint}"
-            f"  Ctx enrich: {self.enable_contextual_enrichment}\n"
-            f"  Extractor : {self.pdf_extractor}\n"
-            f"  SemThresh : {self.semantic_split_threshold}\n"
-            f"  ChunkRange: {self.min_chunk_chars}-{self.max_chunk_chars} chars"
+            f"  Ctx enrich   : {self.enable_contextual_enrichment}\n"
+            f"  Extractor    : {self.pdf_extractor}\n"
+            f"  ChunkRange   : {self.min_chunk_chars}-{self.max_chunk_chars} chars\n"
+            f"  Adv retrieval: {'ON  (rewrite + multi-query + HyDE + MMR + adaptive-k)' if self.enable_advanced_retrieval else 'off (baseline hybrid)'}"
         )
 
 
