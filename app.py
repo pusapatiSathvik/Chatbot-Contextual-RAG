@@ -55,15 +55,29 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def chat(query: ChatRequest) -> Dict:
     global last_summary, db, bm25_index
+
     if db.collection.count() == 0:
         return {"role": "assistant", "content": "No documents yet. Please upload a PDF first."}
 
+    # Prepend conversation summary for context-aware retrieval (same as before)
     extended_query = f"{last_summary}\n\nUser question: {query.input}" if last_summary else query.input
-    retrieved_context, _, _ = retrieve_advanced(extended_query, db, bm25_index, k=10)
-    context = merge_context(retrieved_context)
-    response = get_response(extended_query, context)
-    last_summary = summarize_dialog(query.input, response["content"])
-    return response
+
+    # Phase 4: multi-agent graph replaces the old single-pass pipeline
+    from rag_graph import run_rag_graph
+    final_state = run_rag_graph(extended_query, db=db, bm25=bm25_index)
+
+    # Router said out_of_scope — return polite decline without hallucinating
+    if final_state["query_type"] == "out_of_scope":
+        return {
+            "role": "assistant",
+            "content": "I can only answer questions based on the uploaded documents. This question appears to be outside the scope of the available content.",
+        }
+
+    answer = final_state["answer"]
+
+    # summarize_dialog still runs for conversation memory (unchanged)
+    last_summary = summarize_dialog(query.input, answer)
+    return {"role": "assistant", "content": answer}
 
 
 @app.post("/upload_pdf")
