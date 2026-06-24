@@ -52,6 +52,17 @@ class ChatRequest(BaseModel):
     input: str
 
 
+# ── Phase 4: /chat now runs the multi-agent LangGraph pipeline ───────────────
+# Only this endpoint changed from Phase 3. Everything else is identical.
+# What changed and why:
+#   Before: query → retrieve → merge → LLM → answer  (single pass, no checks)
+#   Now:    query → Router → Retrieval → Grader → Answer → Reflection → answer
+#             - Router skips retrieval entirely for out-of-scope questions
+#             - Grader filters irrelevant chunks before the LLM sees them
+#             - Reflection loops back to retrieval if answer isn't grounded
+# The old retrieve_advanced + get_response calls are replaced by run_rag_graph().
+# summarize_dialog() is still called the same way for conversation memory.
+
 @app.post("/chat")
 def chat(query: ChatRequest) -> Dict:
     global last_summary, db, bm25_index
